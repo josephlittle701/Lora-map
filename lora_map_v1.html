@@ -1,0 +1,417 @@
+<!doctype html>
+<!-- lora_map_v1.html
+     Map + messages for the Heltec LoRa node over Bluetooth (Nordic UART Service).
+     Open in the Bluefy browser on iPhone (Safari and Chrome on iPhone do not support Web Bluetooth).
+     Must be served over https (for example GitHub Pages). Map tiles need internet.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>LoRa Map</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+  :root {
+    --bg: #eef1ee;
+    --panel: #ffffff;
+    --ink: #1f2b33;
+    --muted: #5c6b73;
+    --line: #d3dad6;
+    --self: #e8590c;
+    --other: #2563a8;
+    --bad: #b42318;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141a1e;
+      --panel: #1d252b;
+      --ink: #e4ebe7;
+      --muted: #94a3a0;
+      --line: #2e3a40;
+      --self: #ff7a33;
+      --other: #5b9be0;
+      --bad: #f2756a;
+      color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    display: flex;
+    flex-direction: column;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 14px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+  }
+  header h1 { font-size: 17px; margin: 0; font-weight: 650; }
+  #status { font-size: 13px; color: var(--muted); }
+  button {
+    font: inherit;
+    font-weight: 600;
+    border: 0;
+    border-radius: 8px;
+    padding: 9px 16px;
+    background: var(--self);
+    color: #fff;
+  }
+  button:focus-visible, input:focus-visible { outline: 3px solid var(--other); outline-offset: 2px; }
+  #map { flex: 1 1 auto; min-height: 42vh; }
+  #nodes {
+    background: var(--panel);
+    border-top: 1px solid var(--line);
+    border-bottom: 1px solid var(--line);
+  }
+  .node {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    padding: 8px 14px;
+    font-size: 13px;
+    border-bottom: 1px solid var(--line);
+  }
+  .node:last-child { border-bottom: 0; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; align-self: center; }
+  .node strong { font-size: 14px; }
+  .node .meta { color: var(--muted); }
+  #log {
+    flex: 0 0 auto;
+    max-height: 26vh;
+    overflow-y: auto;
+    padding: 8px 14px;
+    font-size: 14px;
+  }
+  .entry { padding: 3px 0; }
+  .entry time { color: var(--muted); font-size: 12px; margin-right: 6px; }
+  .entry.out { color: var(--self); }
+  .entry.in { color: var(--other); }
+  .entry.sys { color: var(--muted); font-size: 13px; }
+  .entry.err { color: var(--bad); }
+  .empty { color: var(--muted); font-size: 13px; padding: 8px 14px; margin: 0; }
+  form {
+    display: flex;
+    gap: 8px;
+    padding: 10px 14px;
+    background: var(--panel);
+    border-top: 1px solid var(--line);
+  }
+  input {
+    flex: 1;
+    font: inherit;
+    padding: 9px 12px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--bg);
+    color: var(--ink);
+    min-width: 0;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>LoRa Map</h1>
+    <div id="status">Not connected</div>
+  </div>
+  <button id="connectBtn" type="button">Connect</button>
+</header>
+
+<div id="map"></div>
+
+<section id="nodes"><p class="empty">No positions yet. Connect to your board to see nodes here.</p></section>
+
+<section id="log"></section>
+
+<form id="sendForm">
+  <input id="msgInput" maxlength="200" placeholder="Message to send over LoRa" autocomplete="off">
+  <button type="submit">Send</button>
+</form>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+  // Nordic UART Service, same IDs as the board code
+  const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+  const NUS_WRITE   = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // phone writes to board
+  const NUS_NOTIFY  = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // board sends to phone
+
+  const MAX_TRAIL = 500;
+  const MAX_LOG = 200;
+
+  const statusEl = document.getElementById('status');
+  const connectBtn = document.getElementById('connectBtn');
+  const nodesEl = document.getElementById('nodes');
+  const logEl = document.getElementById('log');
+  const form = document.getElementById('sendForm');
+  const input = document.getElementById('msgInput');
+
+  const css = getComputedStyle(document.documentElement);
+  const SELF_COLOR = css.getPropertyValue('--self').trim();
+  const OTHER_COLOR = css.getPropertyValue('--other').trim();
+
+  let device = null;
+  let writeChar = null;
+  let buffer = '';
+  let firstFix = true;
+  const nodes = {};
+
+  // ---------- Map ----------
+  const map = L.map('map').setView([39.5, -105.5], 9);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; OpenStreetMap contributors'
+  }).addTo(map);
+
+  // ---------- Helpers ----------
+  function setStatus(text) { statusEl.textContent = text; }
+
+  function timeNow() {
+    return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  }
+
+  function addLog(text, kind) {
+    const div = document.createElement('div');
+    div.className = 'entry ' + kind;
+    const t = document.createElement('time');
+    t.textContent = timeNow();
+    div.appendChild(t);
+    div.appendChild(document.createTextNode(text));
+    logEl.appendChild(div);
+    while (logEl.children.length > MAX_LOG) logEl.removeChild(logEl.firstChild);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function agoText(ms) {
+    const s = Math.round((Date.now() - ms) / 1000);
+    if (s < 60) return s + 's ago';
+    const m = Math.floor(s / 60);
+    if (m < 60) return m + 'm ago';
+    return Math.floor(m / 60) + 'h ago';
+  }
+
+  // ---------- Nodes ----------
+  function updateNode(name, info) {
+    let n = nodes[name];
+    if (!n) {
+      const color = info.self ? SELF_COLOR : OTHER_COLOR;
+      n = nodes[name] = {
+        name, self: info.self, color,
+        marker: null,
+        trail: L.polyline([], { color, weight: 3, opacity: 0.7 }).addTo(map),
+        points: [], lat: null, lon: null, fix: false, sats: null,
+        rssi: null, snr: null, lastSeen: 0
+      };
+    }
+    n.lastSeen = Date.now();
+    if (info.sats !== undefined) n.sats = info.sats;
+    if (info.rssi != null) { n.rssi = info.rssi; n.snr = info.snr; }
+    if (info.fix !== undefined) n.fix = info.fix;
+
+    if (info.fix && info.lat != null) {
+      n.lat = info.lat;
+      n.lon = info.lon;
+      const ll = [n.lat, n.lon];
+      n.points.push(ll);
+      if (n.points.length > MAX_TRAIL) n.points.shift();
+      n.trail.setLatLngs(n.points);
+      if (!n.marker) {
+        n.marker = L.circleMarker(ll, {
+          radius: 9, color: '#fff', weight: 2, fillColor: n.color, fillOpacity: 1
+        }).addTo(map);
+      } else {
+        n.marker.setLatLng(ll);
+      }
+      n.marker.bindPopup(popupText(n));
+      if (firstFix) {
+        map.setView(ll, 15);
+        firstFix = false;
+      }
+    }
+    renderNodes();
+  }
+
+  function popupText(n) {
+    let s = '<strong>' + escapeHtml(n.name) + '</strong>' + (n.self ? ' (this board)' : '');
+    if (n.lat != null) s += '<br>' + n.lat.toFixed(6) + ', ' + n.lon.toFixed(6);
+    if (n.sats != null) s += '<br>' + n.sats + ' satellites';
+    if (n.rssi != null) s += '<br>RSSI ' + n.rssi + ' dBm, SNR ' + n.snr + ' dB';
+    return s;
+  }
+
+  function renderNodes() {
+    const list = Object.values(nodes);
+    if (list.length === 0) return;
+    nodesEl.innerHTML = '';
+    list.sort((a, b) => (b.self - a.self) || a.name.localeCompare(b.name));
+    for (const n of list) {
+      const row = document.createElement('div');
+      row.className = 'node';
+      const dot = document.createElement('span');
+      dot.className = 'dot';
+      dot.style.background = n.color;
+      const name = document.createElement('strong');
+      name.textContent = n.name + (n.self ? ' (this board)' : '');
+      const meta = document.createElement('span');
+      meta.className = 'meta';
+      let parts = [n.fix ? 'GPS fix' : 'No GPS fix'];
+      if (n.sats != null) parts.push(n.sats + ' sats');
+      if (n.rssi != null) parts.push('RSSI ' + n.rssi);
+      parts.push(agoText(n.lastSeen));
+      meta.textContent = parts.join(', ');
+      row.append(dot, name, meta);
+      if (n.lat != null) row.addEventListener('click', () => map.setView([n.lat, n.lon], Math.max(map.getZoom(), 15)));
+      nodesEl.appendChild(row);
+    }
+  }
+  setInterval(renderNodes, 5000);
+
+  function escapeHtml(s) {
+    return s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  // ---------- Parsing lines from the board ----------
+  // TX: NODE1,25,39.123456,-105.123456,8
+  // TX: NODE1,25,NOFIX,3
+  // RX: NODE2,12,39.1,-105.1,7  RSSI -80 SNR 7.5
+  // RX: NODE2,MSG,hello  RSSI -80 SNR 7.5
+  // SENT: hello
+  function parsePacket(body, isSelf, rssi, snr) {
+    const f = body.split(',');
+    const name = f[0];
+    if (f[1] === 'MSG') {
+      addLog(name + ': ' + f.slice(2).join(','), isSelf ? 'out' : 'in');
+      updateNode(name, { self: isSelf, rssi, snr });
+      return;
+    }
+    if (f[2] === 'NOFIX') {
+      updateNode(name, { self: isSelf, fix: false, sats: f[3], rssi, snr });
+      return;
+    }
+    const lat = parseFloat(f[2]);
+    const lon = parseFloat(f[3]);
+    if (isNaN(lat) || isNaN(lon)) {
+      addLog(body, 'sys');
+      return;
+    }
+    updateNode(name, { self: isSelf, fix: true, lat, lon, sats: f[4], rssi, snr });
+  }
+
+  function handleLine(line) {
+    line = line.trim();
+    if (!line) return;
+
+    if (line.startsWith('TX: ')) {
+      parsePacket(line.slice(4), true, null, null);
+      return;
+    }
+    if (line.startsWith('RX: ')) {
+      let body = line.slice(4);
+      let rssi = null, snr = null;
+      const m = body.match(/\s+RSSI (-?\d+(?:\.\d+)?) SNR (-?\d+(?:\.\d+)?)$/);
+      if (m) {
+        rssi = m[1];
+        snr = m[2];
+        body = body.slice(0, m.index);
+      }
+      if (body === 'CRC error') {
+        addLog('Received a damaged packet', 'err');
+        return;
+      }
+      parsePacket(body, false, rssi, snr);
+      return;
+    }
+    if (line.startsWith('SENT: ')) {
+      addLog('You: ' + line.slice(6), 'out');
+      return;
+    }
+    if (line.startsWith('SEND FAILED') || line.startsWith('TX failed') || line.startsWith('RX failed')) {
+      addLog(line, 'err');
+      return;
+    }
+    addLog(line, 'sys');
+  }
+
+  function onData(event) {
+    buffer += new TextDecoder().decode(event.target.value);
+    let idx;
+    while ((idx = buffer.indexOf('\n')) >= 0) {
+      handleLine(buffer.slice(0, idx));
+      buffer = buffer.slice(idx + 1);
+    }
+  }
+
+  // ---------- Bluetooth ----------
+  async function connect() {
+    if (!navigator.bluetooth) {
+      setStatus('Bluetooth not available here. Open this page in Bluefy.');
+      return;
+    }
+    try {
+      setStatus('Choose your board');
+      device = await navigator.bluetooth.requestDevice({ filters: [{ services: [NUS_SERVICE] }] });
+      device.addEventListener('gattserverdisconnected', onDisconnected);
+      setStatus('Connecting to ' + (device.name || 'board'));
+      const server = await device.gatt.connect();
+      const service = await server.getPrimaryService(NUS_SERVICE);
+      const notifyChar = await service.getCharacteristic(NUS_NOTIFY);
+      writeChar = await service.getCharacteristic(NUS_WRITE);
+      notifyChar.addEventListener('characteristicvaluechanged', onData);
+      await notifyChar.startNotifications();
+      setStatus('Connected to ' + (device.name || 'board'));
+      connectBtn.textContent = 'Disconnect';
+    } catch (e) {
+      setStatus('Connection failed: ' + e.message);
+      writeChar = null;
+    }
+  }
+
+  function onDisconnected() {
+    writeChar = null;
+    buffer = '';
+    connectBtn.textContent = 'Connect';
+    setStatus('Disconnected');
+    addLog('Board disconnected', 'sys');
+  }
+
+  connectBtn.addEventListener('click', () => {
+    if (device && device.gatt.connected) {
+      device.gatt.disconnect();
+    } else {
+      connect();
+    }
+  });
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const text = input.value.trim();
+    if (!text) return;
+    if (!writeChar) {
+      setStatus('Connect to your board first');
+      return;
+    }
+    const data = new TextEncoder().encode(text);
+    try {
+      if (writeChar.writeValueWithResponse) {
+        await writeChar.writeValueWithResponse(data);
+      } else {
+        await writeChar.writeValue(data);
+      }
+      input.value = '';
+    } catch (err) {
+      addLog('Send failed: ' + err.message, 'err');
+    }
+  });
+</script>
+</body>
+</html>
